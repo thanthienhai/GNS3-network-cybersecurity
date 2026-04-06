@@ -1,0 +1,211 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # DMZ ZONE - Public Facing Services
+  # ============================================
+  
+  # Web Server (Apache + PHP)
+  web-server:
+    image: httpd:2.4-alpine
+    container_name: dmz-web-server
+    restart: unless-stopped
+    networks:
+      dmz:
+        ipv4_address: 172.18.0.10
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./web/www:/usr/local/apache2/htdocs
+      - ./web/logs:/usr/local/apache2/logs
+    environment:
+      - SERVER_NAME=infracorp.local
+    labels:
+      - "zone=dmz"
+      - "service=web"
+
+  # Mail Server (Postfix)
+  mail-server:
+    image: boky/postfix:latest
+    container_name: dmz-mail-server
+    restart: unless-stopped
+    networks:
+      dmz:
+        ipv4_address: 172.18.0.20
+    ports:
+      - "25:25"
+      - "587:587"
+    environment:
+      - POSTFIX_HOSTNAME=mail.infracorp.local
+      - ALLOWED_SENDER_DOMAINS=infracorp.local
+    volumes:
+      - ./mail/data:/var/mail
+    labels:
+      - "zone=dmz"
+      - "service=mail"
+
+  # ============================================
+  # SIEM ZONE - ELK Stack
+  # ============================================
+  
+  # Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+    container_name: siem-elasticsearch
+    restart: unless-stopped
+    networks:
+      siem:
+        ipv4_address: 172.19.0.10
+    environment:
+      - node.name=elk-siem
+      - cluster.name=gns3-siem
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ./elk/elasticsearch/data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 | grep -q 'number'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Logstash
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.1
+    container_name: siem-logstash
+    restart: unless-stopped
+    networks:
+      siem:
+        ipv4_address: 172.19.0.11
+    environment:
+      - "LS_JAVA_OPTS=-Xmx512m -Xms512m"
+    volumes:
+      - ./elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./elk/logstash/config:/usr/share/logstash/config:ro
+    ports:
+      - "5514:5514/udp"
+      - "5000:5000"
+      - "5044:5044"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # Kibana
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.1
+    container_name: siem-kibana
+    restart: unless-stopped
+    networks:
+      siem:
+        ipv4_address: 172.19.0.12
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - xpack.security.enabled=false
+      - xpack.encryptedSavedObjects.encryptionKey=your-encryption-key-32-chars-min
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ============================================
+  # KALI LINUX - Attack Platform
+  # ============================================
+  
+  kali-linux:
+    image: kalilinux/kali-rolling:latest
+    container_name: attack-kali-linux
+    restart: unless-stopped
+    networks:
+      attack:
+        ipv4_address: 172.20.0.100
+    privileged: true
+    volumes:
+      - ./kali/scripts:/root/attacks:ro
+      - ./kali/data:/root/data
+    stdin_open: true
+    tty: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+  # ============================================
+  # BACKUP ZONE - Air-gapped Backup
+  # ============================================
+  
+  backup-server:
+    image: linuxserver/duplicati:latest
+    container_name: backup-duplicati
+    restart: unless-stopped
+    networks:
+      backup:
+        ipv4_address: 172.21.0.10
+    ports:
+      - "8200:8200"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+    volumes:
+      - ./backup/config:/config
+      - ./backup/backups:/backups
+      - ./backup/source:/source
+
+  # ============================================
+  # MONITORING
+  # ============================================
+  
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: monitoring-dozzle
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8081:8080"
+    networks:
+      - siem
+
+# ============================================
+# NETWORKS
+# ============================================
+
+networks:
+  dmz:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/24
+          gateway: 172.18.0.1
+  
+  siem:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.0.0/24
+          gateway: 172.19.0.1
+  
+  attack:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+  
+  backup:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+          gateway: 172.21.0.1
